@@ -6,7 +6,7 @@ from decimal import Decimal
 
 from ..config import Config
 from ..exchange import AUTH, ApiError, OmniClient
-from ..strategy.grid import Slot, initial_slots, make_levels
+from ..strategy.grid import Slot, auto_levels, initial_slots, make_levels
 from ..strategy.precision import fmt
 from .orders import FatalError, OrderManager
 from .state import BotState, PendingSlot, StateStore
@@ -26,18 +26,36 @@ class GridEngine:
         self.cfg = cfg
         self.c = client
         self.store = store
-        self.levels = make_levels(cfg.grid_lower, cfg.grid_upper, cfg.grid_levels)
+        # один и тот же list разделяется с OrderManager; в авто-режиме меняется на месте (self.levels[:] = ...)
+        self.levels: list[Decimal] = [] if cfg.auto else make_levels(cfg.grid_lower, cfg.grid_upper, cfg.grid_levels)
         self.st = BotState()
         self.om: OrderManager | None = None
         self.lock = asyncio.Lock()
         self.last_beat = time.monotonic()
         self._last_status = 0.0
         self._errors = 0
+        self._last_recenter = float("-inf")
 
     # ---------------------------------------------------------------- helpers
     def params(self) -> dict:
         sizing = f"pct:{self.cfg.balance_pct}" if self.cfg.balance_pct is not None else f"size:{self.cfg.order_size}"
+        if self.cfg.auto:
+            return {"symbol": self.cfg.symbol, "auto_step_pct": str(self.cfg.grid_step_pct),
+                    "n": self.cfg.grid_levels, "sizing": sizing}
         return {"symbol": self.cfg.symbol, "levels": [str(x) for x in self.levels], "sizing": sizing}
+
+    def _set_levels(self, levels: list[Decimal]):
+        self.levels[:] = levels
+        self.st.levels = [str(x) for x in levels]
+
+    def _grid_str(self) -> str:
+        return " ".join(fmt(self.om.price_for(Slot(i, "buy"))) for i in range(len(self.levels)))
+
+    def _check_precision(self):
+        prices = [self.om.price_for(Slot(i, "buy")) for i in range(len(self.levels))]
+        if len(set(prices)) != len(prices):
+            raise FatalError(f"шаг сетки слишком мелкий для точности цены {self.cfg.symbol} "
+                             f"(уровни слипаются: {' '.join(map(fmt, prices))}) — увеличь GRID_STEP_PCT")
 
     def save(self):
         if not self.cfg.dry_run:
@@ -69,6 +87,12 @@ class GridEngine:
             log.warning("Параметры сетки изменились — строю сетку заново (старые ордера на %s будут отменены)",
                         self.cfg.symbol)
         self.st = saved if resumed else BotState(params=self.params())
+        price = await self.c.mark_price(self.cfg.symbol)
+        if self.cfg.auto:
+            self._set_levels([Decimal(x) for x in self.st.levels] if resumed and self.st.levels
+                             else auto_levels(price, self.cfg.grid_step_pct, self.cfg.grid_levels))
+        else:
+            self._set_levels(self.levels)
         self.om = OrderManager(self.cfg, self.c, self.st, self.levels, self.save)
 
         acc = await self.c.account()
@@ -82,13 +106,14 @@ class GridEngine:
         log.info("%s: status=%s close_only=%s min_notional=%s size_step=%s", inst["symbol"], inst.get("status"),
                  inst.get("close_only"), inst.get("min_notional"), inst.get("size_step"))
 
-        price = await self.c.mark_price(self.cfg.symbol)
+        self._check_precision()
         pos = await self.c.position(self.cfg.symbol)
         log.info("Цена %s | позиция %s (entry %s, liq %s, плечо %s)", price, pos.get("size"), pos.get("entry_price"),
                  pos.get("liquidation_price"), pos.get("leverage"))
-        log.info("Сетка %s: %s | ордер %s | ~%s USDC на ордер", self.cfg.symbol,
-                 " ".join(fmt(self.om.price_for(Slot(i, "buy")))
-                          for i in range(len(self.levels))), fmt(self.om.size), (self.om.size * price).quantize(Decimal("0.01")))
+        mode = f"авто, шаг {self.cfg.grid_step_pct}%" if self.cfg.auto else "фикс. диапазон"
+        log.info("Сетка %s (%s): %s | ордер %s ≈ %s USDC | при выходе цены: %s", self.cfg.symbol, mode,
+                 self._grid_str(), fmt(self.om.size), (self.om.size * price).quantize(Decimal("0.01")),
+                 self.cfg.range_exit_action)
 
         if self.cfg.dry_run:
             for s in sorted(initial_slots(self.levels, price), key=lambda s: s.level):
@@ -118,16 +143,24 @@ class GridEngine:
 
     def _out_of_range(self, price: Decimal) -> bool:
         k = self.cfg.range_exit_pct / 100
-        return price < self.cfg.grid_lower * (1 - k) or price > self.cfg.grid_upper * (1 + k)
+        return price < self.levels[0] * (1 - k) or price > self.levels[-1] * (1 + k)
+
+    def _in_range(self, price: Decimal) -> bool:
+        return self.levels[0] <= price <= self.levels[-1]
 
     async def rebuild(self, price: Decimal):
-        """Снять всё на символе и расставить сетку от текущей цены."""
+        """Снять всё на символе и расставить сетку от текущей цены (в авто-режиме — и пересчитать уровни)."""
         await self.om.cancel_all()
-        if self.cfg.range_exit_action != "none" and self._out_of_range(price):
+        if self.cfg.auto and not self._in_range(price):
+            self._set_levels(auto_levels(price, self.cfg.grid_step_pct, self.cfg.grid_levels))
+            self.om._recalc_size()
+            self._check_precision()
+            log.info("Новые уровни вокруг %s: %s", price, self._grid_str())
+        elif self.cfg.range_exit_action != "none" and self._out_of_range(price):
             self.st.mode = "paused"
             self.save()
-            log.warning("Цена %s вне диапазона [%s, %s] — жду возврата в сетку", price, self.cfg.grid_lower,
-                        self.cfg.grid_upper)
+            log.warning("Цена %s вне диапазона [%s, %s] — жду возврата в сетку", price, self.levels[0],
+                        self.levels[-1])
             return
         self.st.pending = [PendingSlot(s.level, s.side) for s in initial_slots(self.levels, price)]
         self.st.mode = "running"
@@ -213,9 +246,22 @@ class GridEngine:
             return self.halt(f"PnL позиции {pnl} <= -{self.cfg.max_loss_usdc} USDC")
 
         # 3) выход цены из диапазона
-        if self.st.mode == "running" and self.cfg.range_exit_action != "none" and self._out_of_range(price):
-            log.warning("Цена %s вышла за сетку [%s, %s] на >%s%%", price, self.cfg.grid_lower,
-                        self.cfg.grid_upper, self.cfg.range_exit_pct)
+        if (self.st.mode == "running" and self.cfg.range_exit_action == "recenter" and self._out_of_range(price)
+                and time.monotonic() - self._last_recenter >= self.cfg.recenter_min_sec):
+            self._last_recenter = time.monotonic()
+            self.st.stats["recenters"] = self.st.stats.get("recenters", 0) + 1
+            log.warning("Цена %s ушла за сетку [%s, %s] — ПЕРЕСТРАИВАЮ сетку вокруг цены (#%d)", price,
+                        fmt(self.om.price_for(Slot(0, "buy"))), fmt(self.om.price_for(Slot(len(self.levels) - 1, "buy"))),
+                        self.st.stats["recenters"])
+            await self.om.cancel_all()
+            if self.cfg.recenter_flatten:
+                await self.om.flatten()
+                price = await self.c.mark_price(self.cfg.symbol)
+            await self.rebuild(price)
+        elif (self.st.mode == "running" and self.cfg.range_exit_action in ("pause", "close")
+              and self._out_of_range(price)):
+            log.warning("Цена %s вышла за сетку [%s, %s] на >%s%%", price, self.levels[0],
+                        self.levels[-1], self.cfg.range_exit_pct)
             await self.om.cancel_all()
             if self.cfg.range_exit_action == "close":
                 await self.om.flatten()
@@ -223,8 +269,8 @@ class GridEngine:
             self.st.mode = "paused"
             self.save()
             log.warning("Пауза: ордера сняты, позиция %s оставлена. Жду возврата цены в [%s, %s]",
-                        size, self.cfg.grid_lower, self.cfg.grid_upper)
-        elif self.st.mode == "paused" and self.cfg.grid_lower <= price <= self.cfg.grid_upper:
+                        size, self.levels[0], self.levels[-1])
+        elif self.st.mode == "paused" and self._in_range(price):
             log.info("Цена %s вернулась в диапазон — перестраиваю сетку", price)
             await self.rebuild(price)
 

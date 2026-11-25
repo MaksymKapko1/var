@@ -33,10 +33,11 @@ class PendingSlot:
 class BotState:
     params: dict = field(default_factory=dict)
     base_size: str | None = None
+    levels: list[str] = field(default_factory=list)   # текущие уровни (в авто-режиме меняются при recenter)
     orders: dict[str, TrackedOrder] = field(default_factory=dict)   # order_id -> TrackedOrder
     pending: list[PendingSlot] = field(default_factory=list)
     stats: dict = field(default_factory=lambda: {"buys": 0, "sells": 0, "round_trips": 0, "grid_profit": "0",
-                                                 "rejects": 0})
+                                                 "rejects": 0, "recenters": 0})
     mode: str = "running"      # running | paused (цена вне диапазона) | halted (стоп, нужен человек)
     halt_reason: str = ""
     seq: int = 0
@@ -59,7 +60,7 @@ class StateStore:
                 log.warning("Состояние старой версии (%s) — игнорирую", d.get("version"))
                 return None
             return BotState(
-                params=d["params"], base_size=d.get("base_size"),
+                params=d["params"], base_size=d.get("base_size"), levels=d.get("levels", []),
                 orders={k: TrackedOrder(**v) for k, v in d.get("orders", {}).items()},
                 pending=[PendingSlot(**p) for p in d.get("pending", [])],
                 stats=d.get("stats", {}), mode=d.get("mode", "running"),

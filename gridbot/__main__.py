@@ -131,8 +131,10 @@ async def _manual(cfg: Config, close: bool) -> int:
     store = StateStore(cfg.state_file)
     from .core.state import BotState
     st = store.load() or BotState()
-    om = OrderManager(cfg, c, st, make_levels(cfg.grid_lower, cfg.grid_upper, cfg.grid_levels),
-                      lambda: store.save(st))
+    from decimal import Decimal
+    levels = ([Decimal(x) for x in st.levels] if st.levels else
+              make_levels(cfg.grid_lower, cfg.grid_upper, cfg.grid_levels) if not cfg.auto else [Decimal(1), Decimal(2)])
+    om = OrderManager(cfg, c, st, levels, lambda: store.save(st))
     try:
         await om.cancel_all()
         if close:

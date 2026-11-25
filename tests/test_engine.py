@@ -11,8 +11,8 @@ from gridbot.exchange import ApiError, WeightLimiter
 
 def cfg(tmp_path, **kw):
     base = dict(api_key="", api_secret="00" * 32, base_url="x", environment="testnet", symbol="ETH-PERP",
-                grid_lower=D(1000), grid_upper=D(2000), grid_levels=11, order_size=D("0.0105"), balance_pct=None,
-                trigger_by="quote", max_slippage=D("0.02"), range_exit_pct=D(3), range_exit_action="pause",
+                grid_lower=D(1000), grid_upper=D(2000), grid_step_pct=None, grid_levels=11, order_size=D("0.0105"), balance_pct=None,
+                trigger_by="quote", max_slippage=D("0.02"), range_exit_pct=D(3), range_exit_action="pause", recenter_flatten=False, recenter_min_sec=0,
                 max_loss_usdc=None, max_position_mult=D("1.5"), close_max_slippage=D("0.05"),
                 cancel_on_exit=False, close_on_exit=False, bot_id="t", poll_interval=3, risk_interval=3,
                 rate_limit=60, rate_reserve=8, watchdog_sec=300, dry_run=False, data_dir=str(tmp_path),
@@ -282,3 +282,103 @@ def test_initial_sell_fill_is_not_a_round_trip(tmp_path):
         await step(e)
         assert e.st.stats["round_trips"] == 1 and D(e.st.stats["grid_profit"]) == D("1.0")
     asyncio.run(go())
+
+
+# ------------------------------------------------------------------ авто-сетка
+def auto(tmp_path, ex, **kw):
+    base = dict(grid_lower=None, grid_upper=None, grid_step_pct=D("0.5"), grid_levels=6,
+                range_exit_action="recenter", range_exit_pct=D(0))
+    base.update(kw)
+    return engine(tmp_path, ex, **base)
+
+
+def test_auto_grid_centered_on_price(tmp_path):
+    async def go():
+        ex = FakeExchange("2000")
+        e = auto(tmp_path, ex)
+        await e.start(); await step(e)
+        # 6 уровней, шаг 0.5%: 1975 1985 1995 2005 2015 2025
+        assert [int(x) for x in e.levels] == [1975, 1985, 1995, 2005, 2015, 2025]
+        assert len(ex.live()) == 5
+        assert {s for p, s in ex.live() if p < 2000} == {"buy"} and {s for p, s in ex.live() if p > 2000} == {"sell"}
+    asyncio.run(go())
+
+
+def test_auto_recenter_follows_price(tmp_path):
+    async def go():
+        ex = FakeExchange("2000")
+        e = auto(tmp_path, ex)
+        await e.start(); await step(e)
+        ex.move("2100")                          # всё SELL выше исполнилось, цена ушла вверх
+        await step(e)
+        assert e.st.stats["recenters"] == 1 and e.st.mode == "running"
+        assert e.levels[0] < D(2100) < e.levels[-1]
+        await step(e)
+        live = ex.live()
+        assert len(live) == 5 and all(abs(p - 2100) < 40 for p, _ in live)
+    asyncio.run(go())
+
+
+def test_auto_recenter_with_flatten(tmp_path):
+    async def go():
+        ex = FakeExchange("2000")
+        e = auto(tmp_path, ex, recenter_flatten=True)
+        await e.start(); await step(e)
+        ex.move("1900")                          # набрали лонг на всех BUY
+        assert ex.pos > 0
+        await step(e)
+        assert ex.pos == 0 and e.st.stats["recenters"] == 1
+    asyncio.run(go())
+
+
+def test_auto_recenter_cooldown(tmp_path):
+    async def go():
+        ex = FakeExchange("2000")
+        e = auto(tmp_path, ex, recenter_min_sec=3600)
+        await e.start(); await step(e)
+        ex.move("2100"); await step(e)
+        ex.move("2300"); await step(e)
+        assert e.st.stats["recenters"] == 1      # второй раз не чаще раза в час
+    asyncio.run(go())
+
+
+def test_auto_restart_keeps_levels(tmp_path):
+    async def go():
+        ex = FakeExchange("2000")
+        e = auto(tmp_path, ex)
+        await e.start(); await step(e)
+        lv, n = list(e.levels), ex.n
+        ex.price = D("2003")
+        e2 = auto(tmp_path, ex)
+        await e2.start(); await step(e2)
+        assert e2.levels == lv and ex.n == n
+    asyncio.run(go())
+
+
+def test_auto_too_small_step_is_fatal(tmp_path):
+    import pytest
+    from gridbot.core.orders import FatalError
+
+    async def go():
+        ex = FakeExchange("0.5")                 # цена 0.5, 4 значащих -> шаг 0.001% слипнется
+        e = auto(tmp_path, ex, grid_step_pct=D("0.001"), order_size=D(100))
+        with pytest.raises(FatalError):
+            await e.start()
+    asyncio.run(go())
+
+
+def test_config_modes():
+    import os
+    import pytest
+    from gridbot.config import Config, ConfigError
+    env = {"VAR_API_SECRET": "11" * 32, "GRID_STEP_PCT": "0.2", "GRID_BALANCE_PCT": "10"}
+    old = dict(os.environ)
+    try:
+        os.environ.update(env)
+        c = Config.from_env()
+        assert c.auto and c.range_exit_action == "recenter" and c.range_exit_pct == 0
+        os.environ.pop("GRID_STEP_PCT")
+        with pytest.raises(ConfigError):
+            Config.from_env()                     # ни шага, ни диапазона
+    finally:
+        os.environ.clear(); os.environ.update(old)
