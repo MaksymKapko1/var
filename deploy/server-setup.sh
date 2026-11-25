@@ -8,8 +8,9 @@ if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; 
 fi
 
 . /etc/os-release
+case "$ID" in ubuntu|debian) ;; *) echo "Скрипт для Ubuntu/Debian. Для $ID поставь Docker вручную: https://docs.docker.com/engine/install/"; exit 1;; esac
 apt-get update -y
-apt-get install -y ca-certificates curl gnupg rsync make git
+apt-get install -y ca-certificates curl gnupg make git
 install -m 0755 -d /etc/apt/keyrings
 curl -fsSL "https://download.docker.com/linux/${ID}/gpg" -o /etc/apt/keyrings/docker.asc
 chmod a+r /etc/apt/keyrings/docker.asc
