@@ -3,12 +3,27 @@ services:
     build: .
     image: variational-gridbot:latest
     env_file: .env
-    restart: unless-stopped
-    stop_grace_period: 30s   # время на отмену ордеров при остановке
+    init: true                      # корректная доставка SIGTERM и сбор зомби
+    restart: unless-stopped         # падение / ребут сервера -> поднимется сам
+    stop_grace_period: 60s          # время на отмену/закрытие при остановке
     volumes:
-      - ./data:/data        # состояние сетки (state.json) переживает рестарты
+      - botdata:/data               # state.json + heartbeat переживают рестарты и пересборку
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,sys,time; f='/data/heartbeat'; sys.exit(0 if os.path.exists(f) and time.time()-os.path.getmtime(f)<180 else 1)"]
+      interval: 60s
+      timeout: 5s
+      start_period: 120s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "0.50"
     logging:
       driver: json-file
       options:
-        max-size: "10m"
-        max-file: "3"
+        max-size: "20m"
+        max-file: "5"
+
+volumes:
+  botdata:                          # отдельный volume на каждую папку/проект compose

@@ -224,3 +224,6 @@ __marimo__/
 
 # bot state
 data/
+
+# per-server env files
+envs/
