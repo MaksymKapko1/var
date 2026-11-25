@@ -1,7 +1,5 @@
 """Менеджер ордеров: размещение, сверка с биржей, обработка отказов, отмена, закрытие позиции."""
-import asyncio
 import logging
-import secrets
 import time
 from decimal import ROUND_DOWN, ROUND_UP, Decimal
 
@@ -10,6 +8,7 @@ from ..exchange import ApiError, NetworkError, OmniClient
 from ..exchange.errors import PLACE_ERRORS, REJECT_BACKOFF
 from ..strategy.grid import Slot, counter_slot
 from ..strategy.precision import fmt, round_price, round_size
+from .market import flatten_symbol, make_cid
 from .state import BotState, PendingSlot, TrackedOrder
 
 log = logging.getLogger("orders")
@@ -66,7 +65,7 @@ class OrderManager:
     def _next_cid(self) -> str:
         # уникален навсегда (требование API), не зависит от состояния: bot-ms-random
         self.st.seq += 1
-        return f"{self.cfg.bot_id}-{int(time.time() * 1000)}-{secrets.token_hex(3)}"
+        return make_cid(self.cfg.bot_id)
 
     # ------------------------------------------------------------ reconcile
     async def reconcile(self):
@@ -222,33 +221,4 @@ class OrderManager:
 
     async def flatten(self, attempts: int = 6) -> bool:
         """Закрыть позицию по рынку reduce-only. True — позиция ноль."""
-        for i in range(attempts):
-            pos = await self.c.position(self.cfg.symbol)
-            size = Decimal(pos.get("size") or "0")
-            if size == 0:
-                log.info("Позиция %s закрыта", self.cfg.symbol)
-                return True
-            side = "sell" if size > 0 else "buy"
-            slip = min(self.cfg.close_max_slippage * (1 + i), Decimal("0.2"))  # расширяем с каждой попыткой
-            body = {"type": "market", "symbol": self.cfg.symbol, "side": side, "size": fmt(abs(size)),
-                    "max_slippage": fmt(slip), "reduce_only": True, "client_order_id": self._next_cid()}
-            log.warning("ЗАКРЫТИЕ позиции %s: %s %s по рынку (slippage до %s)", size, side, fmt(abs(size)), slip)
-            try:
-                o = await self.c.place_order(body, critical=True)
-                o = await self._wait_final(o["order_id"])
-                log.info("Закрывающий ордер: %s %s", o.get("status"), o.get("reason") or o.get("fill_price"))
-                if o.get("status") == "filled":
-                    continue  # перепроверим позицию сразу
-            except (ApiError, NetworkError) as e:
-                log.error("Закрытие не удалось: %s", e)
-            await asyncio.sleep(min(3 * (i + 1), 15))
-        log.critical("Не удалось закрыть позицию за %d попыток — закрой вручную!", attempts)
-        return False
-
-    async def _wait_final(self, oid: str, timeout: float = 30) -> dict:
-        end = time.time() + timeout
-        o = await self.c.order(oid)
-        while o.get("status") in LIVE and time.time() < end:
-            await asyncio.sleep(2)
-            o = await self.c.order(oid)
-        return o
+        return await flatten_symbol(self.c, self.cfg.symbol, self.cfg.close_max_slippage, self._next_cid, attempts)

@@ -1,7 +1,13 @@
 .git
+.github
 .env
+.env.*
+!.env.example
+!.env.rotation.example
+envs
 data
 tests
+deploy
 .pytest_cache
-__pycache__
+**/__pycache__
 *.pyc

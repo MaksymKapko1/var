@@ -19,6 +19,7 @@ from .config import Config, ConfigError
 from .core.engine import AuthFailure, GridEngine
 from .core.orders import FatalError, OrderManager
 from .core.state import StateStore
+from .core.rotation import RotationAuthFailure, RotationEngine, RotationState, rotation_state_path
 from .core.watchdog import Watchdog
 from .exchange import ApiError, OmniClient, Signer, WeightLimiter
 from .strategy.grid import make_levels
@@ -43,8 +44,14 @@ def make_client(cfg: Config) -> OmniClient:
 
 async def cmd_run(cfg: Config) -> int:
     client = make_client(cfg)
-    engine = GridEngine(cfg, client, StateStore(cfg.state_file))
-    Watchdog(lambda: engine.last_beat, cfg.watchdog_sec, cfg.heartbeat_file).start()
+    if cfg.strategy == "rotation":
+        engine = RotationEngine(cfg, client)
+        wd = max(cfg.watchdog_sec, 900)  # ротация 4 ног с ретраями может идти несколько минут
+    else:
+        engine = GridEngine(cfg, client, StateStore(cfg.state_file))
+        wd = cfg.watchdog_sec
+    log.info("Стратегия: %s", cfg.strategy)
+    Watchdog(lambda: engine.last_beat, wd, cfg.heartbeat_file).start()
 
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -54,7 +61,7 @@ async def cmd_run(cfg: Config) -> int:
     code = 0
     try:
         await engine.run(stop)
-    except AuthFailure as e:
+    except (AuthFailure, RotationAuthFailure) as e:
         log.critical("Ключ не принят: %s. Проверь VAR_API_SECRET, scope 'trade', testnet. Повтор через %ds",
                      e, FATAL_DELAY_SEC)
         await _sleep_unless(stop, FATAL_DELAY_SEC)
@@ -88,24 +95,47 @@ async def cmd_check(cfg: Config) -> int:
         log.info("Аккаунт: %s", await c.account())
         syms = [i["symbol"] for i in await c.instruments()]
         log.info("Инструментов: %d (%s ...)", len(syms), ", ".join(syms[:30]))
-        log.info("%s: %s", cfg.symbol, await c.instrument(cfg.symbol))
-        log.info("Тикер: %s", await c.ticker(cfg.symbol))
-        log.info("Позиция: %s", await c.position(cfg.symbol))
-        log.info("Открытые ордера: %d", len(await c.open_orders(cfg.symbol)))
-        # проверка scope trade: отмена ордеров требует 'trade'; на пустом символе ничего не меняет
-        if not await c.open_orders(cfg.symbol):
-            try:
-                await c.cancel_all(cfg.symbol)
-                log.info("Scope 'trade': OK")
-            except ApiError as e:
+        if cfg.strategy == "rotation":
+            missing = [s for s, _ in cfg.rotation_legs if s not in syms]
+            if missing:
+                log.error("Нет таких инструментов: %s", ", ".join(missing))
+                return 2
+            await RotationEngine(cfg, c).start()  # печатает план по каждой ноге
+        else:
+            log.info("%s: %s", cfg.symbol, await c.instrument(cfg.symbol))
+            log.info("Тикер: %s", await c.ticker(cfg.symbol))
+            log.info("Позиция: %s", await c.position(cfg.symbol))
+            log.info("Открытые ордера: %d", len(await c.open_orders(cfg.symbol)))
+        # проверка scope trade: отмена несуществующего ордера ничего не меняет,
+        # но без 'trade' вернёт insufficient_scope
+        try:
+            await c.cancel_order("00000000-0000-0000-0000-000000000000")
+            log.info("Scope 'trade': OK")
+        except ApiError as e:
+            if e.code in ("insufficient_scope",) or e.status in (401, 403):
                 log.error("Scope 'trade' НЕТ: %s — создай ключ с правом trade", e.code)
                 return 2
+            log.info("Scope 'trade': OK")
         return 0
     finally:
         await c.aclose()
 
 
 async def cmd_status(cfg: Config) -> int:
+    if cfg.strategy == "rotation":
+        st = RotationState(rotation_state_path(cfg))
+        nxt = st.d.get("next_rotation", 0)
+        log.info("Ротация: %s | следующая через %.0f мин | %s", st.d.get("halted") or "работает",
+                 max(nxt - time.time(), 0) / 60, st.stats)
+        c = make_client(cfg)
+        try:
+            for sym, side in cfg.rotation_legs:
+                p = await c.position(sym)
+                log.info("  %-10s нужен %-5s | позиция %s entry %s uPnL %s плечо %s", sym, side, p.get("size"),
+                         p.get("entry_price"), p.get("unrealized_pnl"), p.get("leverage"))
+        finally:
+            await c.aclose()
+        return 0
     st = StateStore(cfg.state_file).load()
     if st:
         log.info("Режим: %s %s | ордеров %d | очередь %d | %s", st.mode, st.halt_reason, len(st.orders),
@@ -128,6 +158,15 @@ async def cmd_status(cfg: Config) -> int:
 
 async def _manual(cfg: Config, close: bool) -> int:
     c = make_client(cfg)
+    if cfg.strategy == "rotation":
+        try:
+            for sym, _ in cfg.rotation_legs:
+                await c.cancel_all(sym)
+            if close:
+                return 0 if await RotationEngine(cfg, c).close_all(halt=True) else 1
+            return 0
+        finally:
+            await c.aclose()
     store = StateStore(cfg.state_file)
     from .core.state import BotState
     st = store.load() or BotState()
@@ -148,6 +187,12 @@ async def _manual(cfg: Config, close: bool) -> int:
 
 
 def cmd_resume(cfg: Config) -> int:
+    if cfg.strategy == "rotation":
+        st = RotationState(rotation_state_path(cfg))
+        st.d["halted"], st.d["next_rotation"] = "", 0
+        st.save()
+        log.info("Ротация возобновлена: при запуске все ноги будут открыты заново.")
+        return 0
     store = StateStore(cfg.state_file)
     st = store.load()
     if not st:

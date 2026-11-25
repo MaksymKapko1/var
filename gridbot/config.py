@@ -44,6 +44,23 @@ def _float(name: str, default: str) -> float:
     return float(_dec(name, default))
 
 
+def _legs(raw: str) -> tuple[tuple[str, str], ...]:
+    legs = []
+    for part in [p.strip() for p in raw.split(",") if p.strip()]:
+        sym, _, side = part.partition(":")
+        side = side.strip().lower()
+        side = {"buy": "long", "sell": "short"}.get(side, side)
+        if side not in ("long", "short"):
+            raise ConfigError(f"ROTATION_LEGS: '{part}' — нужно SYMBOL:long или SYMBOL:short")
+        sym = sym.strip().upper()
+        if "-" not in sym:
+            sym += "-PERP"
+        legs.append((sym, side))
+    if len({s for s, _ in legs}) != len(legs):
+        raise ConfigError("ROTATION_LEGS: символы повторяются")
+    return tuple(legs)
+
+
 @dataclass(frozen=True)
 class Config:
     # --- доступ ---
@@ -81,6 +98,14 @@ class Config:
     dry_run: bool
     data_dir: str
     log_level: str
+    # --- стратегия ---
+    strategy: str = "grid"                                   # grid | rotation
+    rotation_legs: tuple[tuple[str, str], ...] = ()          # ((symbol, long|short), ...)
+    rotation_margin_usdc: Decimal = Decimal(100)             # маржа на одну ногу
+    rotation_notional_usdc: Decimal | None = None            # если задан — объём позиции напрямую (без плеча)
+    rotation_interval_min: float = 60                        # переоткрытие раз в N минут
+    rotation_check_sec: float = 60                           # как часто проверять, что все ноги открыты
+    rotation_max_slippage: Decimal = Decimal("0.01")
 
     @property
     def auto(self) -> bool:
@@ -128,11 +153,36 @@ class Config:
             dry_run=_bool("DRY_RUN", "true"),
             data_dir=_get("DATA_DIR", "/data"),
             log_level=_get("LOG_LEVEL", "INFO").upper(),
+            strategy=_get("STRATEGY", "grid").lower(),
+            rotation_legs=_legs(_get("ROTATION_LEGS", "BTC-PERP:long,ETH-PERP:short,HYPE-PERP:long,SOL-PERP:short")),
+            rotation_margin_usdc=_dec("ROTATION_MARGIN_USDC", "100"),
+            rotation_notional_usdc=_opt_dec("ROTATION_NOTIONAL_USDC"),
+            rotation_interval_min=_float("ROTATION_INTERVAL_MIN", "60"),
+            rotation_check_sec=_float("ROTATION_CHECK_SEC", "60"),
+            rotation_max_slippage=_dec("ROTATION_MAX_SLIPPAGE", "0.01"),
         )
         cfg.validate()
         return cfg
 
     def validate(self):
+        if self.strategy not in ("grid", "rotation"):
+            raise ConfigError("STRATEGY: grid | rotation")
+        if not re.fullmatch(r"[A-Za-z0-9_]{1,10}", self.bot_id):
+            raise ConfigError("BOT_ID: 1-10 символов [A-Za-z0-9_]")
+        if not 0 <= self.rate_reserve < self.rate_limit:
+            raise ConfigError("RATE_LIMIT_RESERVE должен быть меньше RATE_LIMIT_PER_MIN")
+        if self.strategy == "rotation":
+            if not self.rotation_legs:
+                raise ConfigError("ROTATION_LEGS пуст: формат BTC-PERP:long,ETH-PERP:short")
+            if self.rotation_margin_usdc <= 0 and not self.rotation_notional_usdc:
+                raise ConfigError("ROTATION_MARGIN_USDC должен быть > 0")
+            if self.rotation_interval_min < 5:
+                raise ConfigError("ROTATION_INTERVAL_MIN >= 5")
+            if self.rotation_check_sec < 15:
+                raise ConfigError("ROTATION_CHECK_SEC >= 15 (лимит API)")
+            if not 0 < self.rotation_max_slippage <= 1:
+                raise ConfigError("ROTATION_MAX_SLIPPAGE: доля (0, 1], например 0.01")
+            return
         if self.auto:
             if not 0 < self.grid_step_pct <= 20:
                 raise ConfigError("GRID_STEP_PCT: шаг сетки в %, (0, 20], например 0.15")
