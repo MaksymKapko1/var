@@ -229,3 +229,4 @@ data/
 envs/
 
 .env.rotation
+.env.bracket

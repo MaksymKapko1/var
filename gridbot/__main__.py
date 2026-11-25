@@ -19,6 +19,7 @@ from .config import Config, ConfigError
 from .core.engine import AuthFailure, GridEngine
 from .core.orders import FatalError, OrderManager
 from .core.state import StateStore
+from .core.bracket import BracketAuthFailure, BracketEngine, BracketState, bracket_state_path
 from .core.rotation import RotationAuthFailure, RotationEngine, RotationState, rotation_state_path
 from .core.watchdog import Watchdog
 from .exchange import ApiError, OmniClient, Signer, WeightLimiter
@@ -44,7 +45,10 @@ def make_client(cfg: Config) -> OmniClient:
 
 async def cmd_run(cfg: Config) -> int:
     client = make_client(cfg)
-    if cfg.strategy == "rotation":
+    if cfg.strategy == "bracket":
+        engine = BracketEngine(cfg, client)
+        wd = max(cfg.watchdog_sec, 600)
+    elif cfg.strategy == "rotation":
         engine = RotationEngine(cfg, client)
         wd = max(cfg.watchdog_sec, 900)  # ротация 4 ног с ретраями может идти несколько минут
     else:
@@ -61,7 +65,7 @@ async def cmd_run(cfg: Config) -> int:
     code = 0
     try:
         await engine.run(stop)
-    except (AuthFailure, RotationAuthFailure) as e:
+    except (AuthFailure, RotationAuthFailure, BracketAuthFailure) as e:
         log.critical("Ключ не принят: %s. Проверь VAR_API_SECRET, scope 'trade', testnet. Повтор через %ds",
                      e, FATAL_DELAY_SEC)
         await _sleep_unless(stop, FATAL_DELAY_SEC)
@@ -95,7 +99,14 @@ async def cmd_check(cfg: Config) -> int:
         log.info("Аккаунт: %s", await c.account())
         syms = [i["symbol"] for i in await c.instruments()]
         log.info("Инструментов: %d (%s ...)", len(syms), ", ".join(syms[:30]))
-        if cfg.strategy == "rotation":
+        if cfg.strategy == "bracket":
+            missing = [s for s in cfg.bracket_symbols if s not in syms]
+            if missing:
+                log.error("Нет таких инструментов: %s", ", ".join(missing))
+                return 2
+            from dataclasses import replace
+            await BracketEngine(replace(cfg, dry_run=True), c).start()  # только план, без действий
+        elif cfg.strategy == "rotation":
             missing = [s for s, _ in cfg.rotation_legs if s not in syms]
             if missing:
                 log.error("Нет таких инструментов: %s", ", ".join(missing))
@@ -122,6 +133,20 @@ async def cmd_check(cfg: Config) -> int:
 
 
 async def cmd_status(cfg: Config) -> int:
+    if cfg.strategy == "bracket":
+        st = BracketState(bracket_state_path(cfg))
+        log.info("Bracket: %s | %s", st.d.get("halted") or "работает", st.stats)
+        c = make_client(cfg)
+        try:
+            for s in cfg.bracket_symbols:
+                ss = st.sym(s)
+                p = await c.position(s)
+                log.info("  %-11s фаза %-8s %s | позиция %s entry %s uPnL %s", s, ss.get("phase"),
+                         " ".join(f"{k}={ss[k]}" for k in ("side", "entry_px", "tp_px", "sl_px") if ss.get(k)),
+                         p.get("size"), p.get("entry_price"), p.get("unrealized_pnl"))
+        finally:
+            await c.aclose()
+        return 0
     if cfg.strategy == "rotation":
         st = RotationState(rotation_state_path(cfg))
         nxt = st.d.get("next_rotation", 0)
@@ -158,6 +183,18 @@ async def cmd_status(cfg: Config) -> int:
 
 async def _manual(cfg: Config, close: bool) -> int:
     c = make_client(cfg)
+    if cfg.strategy == "bracket":
+        try:
+            e = BracketEngine(cfg, c)
+            if close:
+                return 0 if await e.close_all(halt=True) else 1
+            for s in cfg.bracket_symbols:
+                await c.cancel_all(s)
+                e.st.sym(s).update(phase="flat")
+            e.st.save()
+            return 0
+        finally:
+            await c.aclose()
     if cfg.strategy == "rotation":
         try:
             for sym, _ in cfg.rotation_legs:
@@ -187,6 +224,14 @@ async def _manual(cfg: Config, close: bool) -> int:
 
 
 def cmd_resume(cfg: Config) -> int:
+    if cfg.strategy == "bracket":
+        st = BracketState(bracket_state_path(cfg))
+        st.d["halted"] = ""
+        for s in cfg.bracket_symbols:
+            st.sym(s).update(phase="flat", cooldown_until=0, retry_at=0, fails=0)
+        st.save()
+        log.info("Bracket возобновлён.")
+        return 0
     if cfg.strategy == "rotation":
         st = RotationState(rotation_state_path(cfg))
         st.d["halted"], st.d["next_rotation"] = "", 0

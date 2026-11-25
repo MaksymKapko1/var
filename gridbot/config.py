@@ -44,6 +44,15 @@ def _float(name: str, default: str) -> float:
     return float(_dec(name, default))
 
 
+def _symbols(raw: str) -> tuple[str, ...]:
+    out = []
+    for p in [x.strip().upper() for x in raw.split(",") if x.strip()]:
+        out.append(p if "-" in p else p + "-PERP")
+    if len(set(out)) != len(out):
+        raise ConfigError("BRACKET_SYMBOLS: символы повторяются")
+    return tuple(out)
+
+
 def _legs(raw: str) -> tuple[tuple[str, str], ...]:
     legs = []
     for part in [p.strip() for p in raw.split(",") if p.strip()]:
@@ -106,6 +115,21 @@ class Config:
     rotation_interval_min: float = 60                        # переоткрытие раз в N минут
     rotation_check_sec: float = 60                           # как часто проверять, что все ноги открыты
     rotation_max_slippage: Decimal = Decimal("0.01")
+    # --- bracket: трендовый скальпер с TP/SL ---
+    bracket_symbols: tuple[str, ...] = ("US500-PERP", "XAU-PERP")
+    bracket_margin_usdc: Decimal = Decimal(100)              # маржа на сделку (объём = маржа × плечо)
+    bracket_notional_usdc: Decimal | None = None             # или объём сделки напрямую
+    bracket_tp_pct: Decimal = Decimal("0.10")                # take-profit, % от входа
+    bracket_sl_pct: Decimal = Decimal("0.20")                # stop-loss, % от входа
+    bracket_entry_offset_bps: Decimal = Decimal("1")         # лимитка на N б.п. лучше mark
+    bracket_entry_ttl_sec: float = 90                        # не исполнилась -> переставить
+    bracket_max_hold_min: float = 30                         # держим позицию не дольше
+    bracket_cooldown_sec: float = 30                         # пауза после выхода
+    bracket_poll_sec: float = 10                             # шаг цикла / сэмпл цены для EMA
+    bracket_fast: int = 12                                   # быстрая EMA (в сэмплах)
+    bracket_slow: int = 48                                   # медленная EMA
+    bracket_min_samples: int = 6                             # прогрев перед первым входом
+    bracket_session_guard_min: float = 5                     # закрыть за N мин до закрытия сессии
 
     @property
     def auto(self) -> bool:
@@ -160,17 +184,45 @@ class Config:
             rotation_interval_min=_float("ROTATION_INTERVAL_MIN", "60"),
             rotation_check_sec=_float("ROTATION_CHECK_SEC", "60"),
             rotation_max_slippage=_dec("ROTATION_MAX_SLIPPAGE", "0.01"),
+            bracket_symbols=_symbols(_get("BRACKET_SYMBOLS", "US500-PERP,XAU-PERP")),
+            bracket_margin_usdc=_dec("BRACKET_MARGIN_USDC", "100"),
+            bracket_notional_usdc=_opt_dec("BRACKET_NOTIONAL_USDC"),
+            bracket_tp_pct=_dec("BRACKET_TP_PCT", "0.10"),
+            bracket_sl_pct=_dec("BRACKET_SL_PCT", "0.20"),
+            bracket_entry_offset_bps=_dec("BRACKET_ENTRY_OFFSET_BPS", "1"),
+            bracket_entry_ttl_sec=_float("BRACKET_ENTRY_TTL_SEC", "90"),
+            bracket_max_hold_min=_float("BRACKET_MAX_HOLD_MIN", "30"),
+            bracket_cooldown_sec=_float("BRACKET_COOLDOWN_SEC", "30"),
+            bracket_poll_sec=_float("BRACKET_POLL_SEC", "10"),
+            bracket_fast=int(_dec("BRACKET_FAST", "12")),
+            bracket_slow=int(_dec("BRACKET_SLOW", "48")),
+            bracket_min_samples=int(_dec("BRACKET_MIN_SAMPLES", "6")),
+            bracket_session_guard_min=_float("BRACKET_SESSION_GUARD_MIN", "5"),
         )
         cfg.validate()
         return cfg
 
     def validate(self):
-        if self.strategy not in ("grid", "rotation"):
-            raise ConfigError("STRATEGY: grid | rotation")
+        if self.strategy not in ("grid", "rotation", "bracket"):
+            raise ConfigError("STRATEGY: grid | rotation | bracket")
         if not re.fullmatch(r"[A-Za-z0-9_]{1,10}", self.bot_id):
             raise ConfigError("BOT_ID: 1-10 символов [A-Za-z0-9_]")
         if not 0 <= self.rate_reserve < self.rate_limit:
             raise ConfigError("RATE_LIMIT_RESERVE должен быть меньше RATE_LIMIT_PER_MIN")
+        if self.strategy == "bracket":
+            if not self.bracket_symbols:
+                raise ConfigError("BRACKET_SYMBOLS пуст")
+            if not (0 < self.bracket_tp_pct <= 10 and 0 < self.bracket_sl_pct <= 10):
+                raise ConfigError("BRACKET_TP_PCT / BRACKET_SL_PCT: в процентах (0, 10], например 0.1")
+            if self.bracket_margin_usdc <= 0 and not self.bracket_notional_usdc:
+                raise ConfigError("BRACKET_MARGIN_USDC должен быть > 0")
+            if self.bracket_poll_sec < 5:
+                raise ConfigError("BRACKET_POLL_SEC >= 5 (лимит API)")
+            if not 2 <= self.bracket_fast < self.bracket_slow:
+                raise ConfigError("нужно 2 <= BRACKET_FAST < BRACKET_SLOW")
+            if self.bracket_entry_ttl_sec < self.bracket_poll_sec:
+                raise ConfigError("BRACKET_ENTRY_TTL_SEC должен быть >= BRACKET_POLL_SEC")
+            return
         if self.strategy == "rotation":
             if not self.rotation_legs:
                 raise ConfigError("ROTATION_LEGS пуст: формат BTC-PERP:long,ETH-PERP:short")
