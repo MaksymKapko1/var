@@ -23,6 +23,13 @@ def make_levels(lower: Decimal, upper: Decimal, n: int) -> list[Decimal]:
     return [lower + step * i for i in range(n)]
 
 
+def auto_levels(center: Decimal, step_pct: Decimal, n: int) -> list[Decimal]:
+    """Узкая сетка вокруг цены: шаг step_pct % между соседними уровнями, цена — в середине."""
+    k = step_pct / 100
+    mid = Decimal(n - 1) / 2
+    return [center * (1 + k * (Decimal(i) - mid)) for i in range(n)]
+
+
 def initial_slots(levels: list[Decimal], price: Decimal) -> list[Slot]:
     """Начальная раскладка: пропускаем уровень, ближайший к текущей цене."""
     nearest = min(range(len(levels)), key=lambda i: abs(levels[i] - price))
