@@ -1,0 +1,14 @@
+services:
+  gridbot:
+    build: .
+    image: variational-gridbot:latest
+    container_name: variational-gridbot
+    env_file: .env
+    restart: unless-stopped
+    volumes:
+      - ./data:/data        # состояние сетки (state.json) переживает рестарты
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
