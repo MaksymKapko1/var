@@ -2,9 +2,9 @@ services:
   gridbot:
     build: .
     image: variational-gridbot:latest
-    container_name: variational-gridbot
     env_file: .env
     restart: unless-stopped
+    stop_grace_period: 30s   # время на отмену ордеров при остановке
     volumes:
       - ./data:/data        # состояние сетки (state.json) переживает рестарты
     logging:

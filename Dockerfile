@@ -12,4 +12,5 @@ RUN useradd -m bot && mkdir -p /data && chown bot /data
 USER bot
 VOLUME ["/data"]
 
+STOPSIGNAL SIGTERM
 ENTRYPOINT ["python", "-m", "gridbot.main"]
