@@ -382,3 +382,17 @@ def test_config_modes():
             Config.from_env()                     # ни шага, ни диапазона
     finally:
         os.environ.clear(); os.environ.update(old)
+
+
+def test_env_empty_value_with_inline_comment():
+    import os
+    from gridbot.config import Config
+    old = dict(os.environ)
+    try:
+        os.environ.update({"VAR_API_SECRET": "11" * 32, "VAR_API_KEY": "# публичный 0x... — можно не заполнять",
+                           "GRID_STEP_PCT": "0.1   # шаг", "GRID_BALANCE_PCT": "10", "ORDER_SIZE": "# или фикс",
+                           "MAX_LOSS_USDC": "#"})
+        c = Config.from_env()
+        assert c.api_key == "" and c.order_size is None and c.max_loss_usdc is None and str(c.grid_step_pct) == "0.1"
+    finally:
+        os.environ.clear(); os.environ.update(old)

@@ -14,7 +14,10 @@ class ConfigError(Exception):
 def _get(name: str, default: str | None = None, required: bool = False) -> str:
     val = os.getenv(name, default)
     if val is not None:
-        val = val.split(" #")[0].strip().strip('"').strip("'")  # допускаем комментарии/кавычки в .env
+        val = val.strip()
+        if val.startswith("#"):  # пустое значение с комментарием: docker compose отдаёт сам комментарий
+            val = ""
+        val = val.split(" #")[0].split("\t#")[0].strip().strip('"').strip("'")
     if required and not val:
         raise ConfigError(f"переменная окружения {name} не задана (см. .env.example)")
     return val or ""
