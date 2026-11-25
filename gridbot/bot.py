@@ -22,7 +22,8 @@ class GridBot:
         self.levels = make_levels(cfg.grid_lower, cfg.grid_upper, cfg.grid_levels)
         self.inst: dict = {}
         self.inst_ts = 0.0
-        self.size = cfg.order_size
+        self.base_size: Decimal | None = cfg.order_size  # до округления под size_step
+        self.size = cfg.order_size or Decimal(0)
         self.seq = 0
         # state
         self.orders: dict[str, dict] = {}  # order_id -> {level, side, cid, price}
@@ -31,7 +32,8 @@ class GridBot:
 
     # ---------------- state ----------------
     def _params(self) -> dict:
-        return {"symbol": self.cfg.symbol, "levels": [str(x) for x in self.levels], "size": str(self.cfg.order_size)}
+        sizing = f"pct:{self.cfg.balance_pct}" if self.cfg.balance_pct is not None else f"size:{self.cfg.order_size}"
+        return {"symbol": self.cfg.symbol, "levels": [str(x) for x in self.levels], "sizing": sizing}
 
     def load_state(self) -> bool:
         f = self.cfg.state_file
@@ -49,6 +51,8 @@ class GridBot:
         self.orders = data.get("orders", {})
         self.pending = data.get("pending", [])
         self.stats.update(data.get("stats", {}))
+        if data.get("base_size"):
+            self.base_size = Decimal(data["base_size"])
         return bool(self.orders or self.pending)
 
     def save_state(self):
@@ -59,7 +63,7 @@ class GridBot:
         tmp = f + ".tmp"
         with open(tmp, "w") as fh:
             json.dump({"params": self._params(), "orders": self.orders, "pending": self.pending,
-                       "stats": self.stats}, fh, indent=1)
+                       "stats": self.stats, "base_size": str(self.base_size) if self.base_size else None}, fh, indent=1)
         os.replace(tmp, f)
 
     # ---------------- instrument ----------------
@@ -69,15 +73,28 @@ class GridBot:
         self.inst = self.c.instrument(self.cfg.symbol)
         self.inst_ts = time.time()
         step = Decimal(self.inst["size_step"]) if self.inst.get("size_step") else Decimal(0)
-        size = round_size(self.cfg.order_size, step) if step else self.cfg.order_size
+        if self.base_size is None:
+            return  # размер ещё не посчитан из баланса (см. startup)
+        size = round_size(self.base_size, step) if step else self.base_size
         if size <= 0:
-            raise SystemExit(f"[config] ORDER_SIZE {self.cfg.order_size} меньше size_step {step}")
+            raise SystemExit(f"[config] размер ордера {self.base_size} меньше size_step {step}")
         if size != self.size:
             log.info("Размер ордера округлён под size_step=%s: %s", step, size)
         self.size = size
         min_notional = Decimal(self.inst["min_notional"])
         if size * self.levels[0] < min_notional:
-            raise SystemExit(f"[config] ORDER_SIZE*GRID_LOWER = {size * self.levels[0]} < min_notional {min_notional} USDC")
+            raise SystemExit(f"[config] ордер {size} x {self.levels[0]} = {size * self.levels[0]} USDC < min_notional {min_notional}")
+
+    def size_from_balance(self, equity: Decimal) -> Decimal:
+        """GRID_BALANCE_PCT: % equity = суммарный объём (notional) всех ордеров сетки."""
+        budget = equity * self.cfg.balance_pct / 100
+        per_order = budget / (len(self.levels) - 1)
+        mid = (self.levels[0] + self.levels[-1]) / 2
+        size = per_order / mid
+        log.info("Размер из баланса: equity=%s × %s%% = %s USDC на сетку -> %s USDC на ордер -> %s %s",
+                 equity, self.cfg.balance_pct, budget.quantize(Decimal("0.01")), per_order.quantize(Decimal("0.01")),
+                 size.quantize(Decimal("0.00000001")), self.cfg.symbol.split("-")[0])
+        return size
 
     def price_for(self, slot: Slot) -> Decimal:
         rounding = ROUND_DOWN if slot.side == "buy" else ROUND_UP
@@ -95,6 +112,10 @@ class GridBot:
         if i.get("close_only"):
             raise SystemExit(f"{self.cfg.symbol} в режиме close_only — новые позиции открывать нельзя")
         acc = self.c.account()
+        resumed = False if self.cfg.dry_run else self.load_state()
+        if self.cfg.balance_pct is not None and not resumed:
+            self.base_size = self.size_from_balance(Decimal(acc["equity"]))
+        self.refresh_instrument(force=True)
         log.info("Аккаунт: equity=%s uPnL=%s IM=%s MM=%s", acc.get("equity"), acc.get("unrealized_pnl"),
                  acc.get("initial_margin"), acc.get("maintenance_margin"))
         pos = self.c.position(self.cfg.symbol)
@@ -113,7 +134,7 @@ class GridBot:
                 log.info("[DRY_RUN] поставил бы %s %s @ %s", s.side.upper(), self.size, fmt(self.price_for(s)))
             return
 
-        if self.load_state():
+        if resumed:
             log.info("Продолжаю по сохранённому состоянию: %d ордеров, %d в очереди, статистика %s",
                      len(self.orders), len(self.pending), self.stats)
             return

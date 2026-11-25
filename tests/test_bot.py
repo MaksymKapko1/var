@@ -7,7 +7,7 @@ from gridbot.grid import Slot, counter_slot, initial_slots, make_levels
 
 def cfg(tmp_path, **kw):
     base = dict(api_key="", api_secret="00" * 32, base_url="x", environment="testnet", symbol="ETH-PERP",
-                grid_lower=D(1000), grid_upper=D(2000), grid_levels=11, order_size=D("0.0105"),
+                grid_lower=D(1000), grid_upper=D(2000), grid_levels=11, order_size=D("0.0105"), balance_pct=None,
                 trigger_by="quote", max_slippage=D("0.02"), bot_id="t", poll_interval=0, dry_run=False,
                 cancel_on_exit=True, state_file=str(tmp_path / "state.json"), log_level="INFO")
     base.update(kw)
@@ -120,3 +120,16 @@ def test_dry_run_places_nothing(tmp_path):
     bot = GridBot(cfg(tmp_path, dry_run=True), api)
     bot.startup(); bot.tick(); bot.shutdown()
     assert api.n == 0
+
+
+def test_balance_pct_sizing_and_persist(tmp_path):
+    api = FakeApi("1550")
+    # equity 1000 × 15% = 150 USDC на сетку / 10 ордеров = 15 USDC / mid 1500 = 0.01
+    c = cfg(tmp_path, order_size=None, balance_pct=D(15))
+    bot = GridBot(c, api)
+    bot.startup(); bot.tick()
+    assert bot.size == D("0.01") and api.placed[0]["size"] == "0.01"
+    api.account = lambda: {"equity": "5000"}  # баланс вырос — на рестарте размер не меняется
+    bot2 = GridBot(c, api)
+    bot2.startup()
+    assert bot2.size == D("0.01")

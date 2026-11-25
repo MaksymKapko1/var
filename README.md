@@ -89,7 +89,8 @@ docker compose up -d
 | `VAR_BASE_URL`, `VAR_ENVIRONMENT` | `https://api.omni.testnet.variational.io` и `testnet` |
 | `SYMBOL` | например `ETH-PERP`, `BTC-PERP` |
 | `GRID_LOWER`, `GRID_UPPER`, `GRID_LEVELS` | границы и число уровней (3–50) |
-| `ORDER_SIZE` | размер одного ордера в базовом активе |
+| `GRID_BALANCE_PCT` | % от equity на **всю** сетку, бот сам считает размер под любую монету. Например `10` при 10k даёт 1000$ на все ордера |
+| `ORDER_SIZE` | или вместо процента: фиксированный размер одного ордера в монетах (`0.05` ETH). Задаётся только одно из двух |
 | `TRIGGER_BY` | `quote` или `mark` |
 | `MAX_SLIPPAGE` | доля от mark, например `0.02`; `none` значит без ограничения |
 | `BOT_ID` | префикс `client_order_id` |
