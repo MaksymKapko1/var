@@ -1,0 +1,16 @@
+FROM python:3.12-slim
+
+ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY gridbot ./gridbot
+
+RUN useradd -m bot && mkdir -p /data && chown bot /data
+USER bot
+VOLUME ["/data"]
+
+STOPSIGNAL SIGTERM
+ENTRYPOINT ["python", "-m", "gridbot.main"]
