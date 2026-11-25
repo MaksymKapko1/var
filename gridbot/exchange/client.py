@@ -139,20 +139,24 @@ class OmniClient:
         res = (await self.request("GET", "/v1/orders", params={"client_order_id": cid}))["results"]
         return res[0] if res else None
 
-    async def place_order(self, body: dict, critical: bool = False) -> dict:
-        """Идемпотентно: повтор с тем же client_order_id не создаёт дубль (биржа вернёт существующий)."""
+    async def place_orders(self, body: dict, critical: bool = False) -> list[dict]:
+        """POST /v1/orders -> [ордер, take_profit?, stop_loss?].
+        Идемпотентно: повтор с тем же client_order_id не создаёт дубль (биржа вернёт существующий)."""
         try:
-            return (await self.request("POST", "/v1/orders", body=body, critical=critical))["placed"][0]
+            return (await self.request("POST", "/v1/orders", body=body, critical=critical))["placed"]
         except ApiError as e:
             if e.code == "duplicate_client_order_id" and e.body.get("order"):
-                return e.body["order"]
+                return [e.body["order"]]
             raise
         except NetworkError:
             if body.get("client_order_id"):
                 found = await self.order_by_client_id(body["client_order_id"])
                 if found:
-                    return found
+                    return [found]
             raise
+
+    async def place_order(self, body: dict, critical: bool = False) -> dict:
+        return (await self.place_orders(body, critical))[0]
 
     async def cancel_order(self, order_id: str) -> dict:
         return await self.request("DELETE", "/v1/orders", params={"order_id": order_id}, critical=True)

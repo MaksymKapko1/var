@@ -227,3 +227,6 @@ data/
 
 # per-server env files
 envs/
+
+.env.rotation
+.env.bracket

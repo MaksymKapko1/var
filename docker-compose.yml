@@ -2,7 +2,9 @@ services:
   gridbot:
     build: .
     image: variational-gridbot:latest
-    env_file: .env
+    env_file:
+      - path: .env
+        required: false
     init: true                      # корректная доставка SIGTERM и сбор зомби
     restart: unless-stopped         # падение / ребут сервера -> поднимется сам
     stop_grace_period: 60s          # время на отмену/закрытие при остановке
@@ -25,5 +27,65 @@ services:
         max-size: "20m"
         max-file: "5"
 
+  rotation:
+    profiles: ["rotation"]        # запускается только через make rot-up
+    build: .
+    image: variational-gridbot:latest
+    env_file:
+      - path: .env.rotation
+        required: false
+    init: true                      # корректная доставка SIGTERM и сбор зомби
+    restart: unless-stopped         # падение / ребут сервера -> поднимется сам
+    stop_grace_period: 60s          # время на отмену/закрытие при остановке
+    volumes:
+      - rotdata:/data               # state.json + heartbeat переживают рестарты и пересборку
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,sys,time; f='/data/heartbeat'; sys.exit(0 if os.path.exists(f) and time.time()-os.path.getmtime(f)<180 else 1)"]
+      interval: 60s
+      timeout: 5s
+      start_period: 120s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "0.50"
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+  bracket:
+    profiles: ["bracket"]         # запускается только через make br-up
+    build: .
+    image: variational-gridbot:latest
+    env_file:
+      - path: .env.bracket
+        required: false
+    init: true                      # корректная доставка SIGTERM и сбор зомби
+    restart: unless-stopped         # падение / ребут сервера -> поднимется сам
+    stop_grace_period: 60s          # время на отмену/закрытие при остановке
+    volumes:
+      - brdata:/data               # state.json + heartbeat переживают рестарты и пересборку
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,sys,time; f='/data/heartbeat'; sys.exit(0 if os.path.exists(f) and time.time()-os.path.getmtime(f)<180 else 1)"]
+      interval: 60s
+      timeout: 5s
+      start_period: 120s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "0.50"
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
 volumes:
   botdata:                          # отдельный volume на каждую папку/проект compose
+  rotdata:
+  brdata:
